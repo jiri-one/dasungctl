@@ -1,0 +1,3 @@
+# dasungctl: Dasung monitors take their settings over an internal CH340 UART. udev cannot tell
+# it from other CH340 adapters, so this gives the user at the seat access to all of them.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", TAG+="uaccess"

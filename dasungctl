@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Control the front light and display settings of Dasung Paperlike e-ink monitors."""
+import argparse
+import fcntl
+import os
+import select
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+DASUNG_VENDOR = "27c0"
+CH341_SPI = ("1a86", "5512")
+
+CONTRAST, MODE, REFRESH, SPEED = 0x01, 0x02, 0x03, 0x04
+LIGHT, TEMPERATURE, BRIGHTNESS = 0x07, 0x08, 0x09
+GET, VERSION = 0x0A, 0x10
+ACK = 0xF0
+
+LIGHT_MODES = {"off": 0, "cold": 1, "warm": 2, "mixed": 3}
+LIGHT_NAMES = {v: k for k, v in LIGHT_MODES.items()}
+
+PARAMS = {"contrast": CONTRAST, "mode": MODE, "speed": SPEED, "light": LIGHT,
+          "temperature": TEMPERATURE, "brightness": BRIGHTNESS}
+# The official clients clamp to these ranges before sending.
+RANGES = {"contrast": range(1, 10), "mode": range(2, 8), "speed": range(1, 6),
+          "temperature": range(0, 101)}
+
+# Perceived brightness is roughly logarithmic, so single steps only matter at the dark end.
+LADDER = [*range(1, 11), 12, 14, 16, 18, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100]
+
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "dasungctl"
+
+
+def usb_ids(hub):
+    ids = set()
+    for dev in hub.iterdir():
+        try:
+            ids.add(((dev / "idVendor").read_text().strip(),
+                     (dev / "idProduct").read_text().strip()))
+        except OSError:
+            pass
+    return ids
+
+
+def find_ports():
+    found = {}
+    for tty_dir in sorted(Path("/sys/class/tty").glob("ttyUSB*")):
+        try:
+            ids = usb_ids((tty_dir / "device").resolve().parents[2])
+        except (OSError, IndexError):
+            continue
+        # Dasungs keep a CH341 flash programmer next to the UART; requiring it keeps frames
+        # away from other CH340 adapters, such as the one inside the BOOX Mira.
+        if CH341_SPI not in ids:
+            continue
+        # Of the tested models only the 13.3" adds a touch controller to that hub.
+        name = "13" if any(vendor == DASUNG_VENDOR for vendor, _ in ids) else "253"
+        found.setdefault(name, f"/dev/{tty_dir.name}")
+    return found
+
+
+class Monitor:
+    def __init__(self, path, debug=False):
+        self.debug = debug
+        self.pending = ""
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        # Key bindings can start several instances at once; their requests must not interleave.
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    os.close(self.fd)
+                    sys.exit(f"dasungctl: {path} is busy (is `dasungctl tune` or `watch` running?)")
+                time.sleep(0.05)
+        cc = termios.tcgetattr(self.fd)[6]
+        cc[termios.VMIN] = 0
+        cc[termios.VTIME] = 0
+        cflag = termios.CS8 | termios.CREAD | termios.CLOCAL
+        termios.tcsetattr(self.fd, termios.TCSANOW,
+                          [0, 0, cflag, 0, termios.B115200, termios.B115200, cc])
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+
+    def close(self):
+        termios.tcdrain(self.fd)
+        os.close(self.fd)
+
+    def send(self, cmd, value=0):
+        frame = f"5FF5{cmd:02X}{value & 0xFF:02X}{0:012X}A0FA"
+        if self.debug:
+            print(f">> {frame}", file=sys.stderr)
+        os.write(self.fd, frame.encode())
+
+    def read(self):
+        self.pending += os.read(self.fd, 256).decode("ascii", "replace").upper()
+
+    def parse(self):
+        while True:
+            i = self.pending.find("5FF5")
+            if i < 0:
+                # Keep a possible partial prefix for the next read.
+                self.pending = self.pending[-3:]
+                return
+            if len(self.pending) - i < 24:
+                self.pending = self.pending[i:]
+                return
+            frame = self.pending[i:i + 24]
+            try:
+                payload = bytes.fromhex(frame[4:20])
+            except ValueError:
+                payload = None
+            if payload is None or not frame.endswith("A0FA"):
+                self.pending = self.pending[i + 1:]
+                continue
+            self.pending = self.pending[i + 24:]
+            if self.debug:
+                print(f"<< {frame}", file=sys.stderr)
+            yield payload
+
+    def frames(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            yield from self.parse()
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                return
+            if not select.select([self.fd], [], [], left)[0]:
+                return
+            self.read()
+
+    def query(self, param, timeout=1.0):
+        self.send(GET, param)
+        for payload in self.frames(timeout):
+            # Button presses and status pushes can arrive in between, so match the reply.
+            if payload[:3] == bytes([ACK, GET, param]):
+                return payload
+        return None
+
+    def get(self, param):
+        payload = self.query(param)
+        if payload is None:
+            sys.exit("dasungctl: the monitor did not answer")
+        return payload[3]
+
+
+def remember_mode(name, mode):
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / f"light-{name}").write_text(f"{mode}\n")
+
+
+def remembered_mode(name):
+    try:
+        mode = int((STATE / f"light-{name}").read_text())
+    except (OSError, ValueError):
+        mode = 0
+    return mode if mode in LIGHT_NAMES and mode else LIGHT_MODES["warm"]
+
+
+def current_brightness(mon):
+    return mon.get(BRIGHTNESS) if mon.get(LIGHT) else 0
+
+
+def set_brightness(mon, name, target):
+    """Brightness 0 switches the light off; anything above it switches it back on."""
+    mode = mon.get(LIGHT)
+    if target <= 0:
+        if mode:
+            remember_mode(name, mode)
+            mon.send(LIGHT, 0)
+        return
+    mon.send(BRIGHTNESS, target)
+    if not mode:
+        mon.send(LIGHT, remembered_mode(name))
+
+
+def level_arg(text):
+    if text in ("up", "down"):
+        return text
+    try:
+        int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use 0-100, +N, -N, up or down") from None
+    return text
+
+
+def target_level(current, text):
+    if text == "up":
+        return next((v for v in LADDER if v > current), LADDER[-1])
+    if text == "down":
+        return next((v for v in reversed(LADDER) if v < current), 0)
+    value = int(text)
+    return max(0, min(100, current + value if text[0] in "+-" else value))
+
+
+def tune(mon, name):
+    state = {p: mon.get(p) for p in (LIGHT, TEMPERATURE, BRIGHTNESS)}
+    print(f'Dasung {name}": ←/→ brightness ±1   ↓/↑ temperature ±5   m light   q quit')
+    saved = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin)
+    try:
+        while True:
+            print(f"\r\x1b[Klight {LIGHT_NAMES.get(state[LIGHT], state[LIGHT]):6}"
+                  f"  brightness {state[BRIGHTNESS]:3}  temperature {state[TEMPERATURE]:3}",
+                  end="", flush=True)
+            ready = select.select([sys.stdin, mon.fd], [], [])[0]
+            if mon.fd in ready:
+                mon.read()
+                # The monitor pushes every change, button presses included, as [param, value].
+                for payload in mon.parse():
+                    if payload[0] in state:
+                        state[payload[0]] = payload[1]
+            if sys.stdin not in ready:
+                continue
+            key = os.read(sys.stdin.fileno(), 8).decode(errors="ignore")
+            if key in ("q", "\x1b"):
+                break
+            if key in ("\x1b[C", "\x1b[D"):
+                param, delta = BRIGHTNESS, 1 if key == "\x1b[C" else -1
+            elif key in ("\x1b[A", "\x1b[B"):
+                param, delta = TEMPERATURE, 5 if key == "\x1b[A" else -5
+            elif key == "m":
+                state[LIGHT] = (state[LIGHT] + 1) % 4
+                mon.send(LIGHT, state[LIGHT])
+                continue
+            else:
+                continue
+            state[param] = max(0, min(100, state[param] + delta))
+            mon.send(param, state[param])
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        print()
+    if state[LIGHT]:
+        remember_mode(name, state[LIGHT])
+
+
+def show_info(mon):
+    payload = mon.query(VERSION)
+    print(f"{'firmware':11} " + ("no reply" if payload is None else
+                                 f"MCU {payload[3]:02x}.{payload[4]:02x}"))
+    for name, param in PARAMS.items():
+        payload = mon.query(param)
+        value = "no reply" if payload is None else payload[3]
+        if param == LIGHT and payload is not None:
+            value = LIGHT_NAMES.get(value, value)
+        print(f"{name:11} {value}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="dasungctl", description=__doc__.splitlines()[0])
+    ap.add_argument("-m", "--monitor", choices=["253", "13"],
+                    help='25.3" or 13.3" model (default: the only one connected, else 253)')
+    ap.add_argument("--port", help="serial device instead of autodetection")
+    ap.add_argument("--debug", action="store_true", help="print raw frames")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+    sub.add_parser("list", help="show detected monitors")
+    sub.add_parser("info", help="show firmware version and settings")
+    sub.add_parser("tune", help="adjust the front light with the arrow keys")
+    sub.add_parser("brightness", help="front light brightness; 0 switches the light off").add_argument(
+        "value", nargs="?", type=level_arg, help="0-100, +N, -N, up or down")
+    sub.add_parser("light", help="front light colour").add_argument(
+        "value", nargs="?", choices=list(LIGHT_MODES))
+    sub.add_parser("temperature", help="colour temperature of mixed light, 0 warm to 100 cold"
+                   ).add_argument("value", type=int, nargs="?")
+    sub.add_parser("contrast", help="1-9").add_argument("value", type=int, nargs="?")
+    sub.add_parser("mode", help="image mode, 2-7 (meaning differs by model)").add_argument(
+        "value", type=int, nargs="?")
+    sub.add_parser("speed", help="refresh speed, 1-5").add_argument("value", type=int, nargs="?")
+    sub.add_parser("refresh", help="clear ghosting")
+    raw = sub.add_parser("raw", help="send any command and print the replies (protocol research)")
+    raw.add_argument("command", type=lambda s: int(s, 0))
+    raw.add_argument("value", type=lambda s: int(s, 0), nargs="?", default=0)
+    raw.add_argument("--wait", type=float, default=1.0, help="seconds to wait for replies")
+    sub.add_parser("watch", help="print the frames the monitor sends")
+    args = ap.parse_args()
+
+    ports = find_ports()
+    if args.cmd == "list":
+        for name, port in sorted(ports.items()):
+            print(f'{name}"  {port}')
+        return
+    name = args.monitor or ("253" if "253" in ports or args.port else next(iter(ports), None))
+    port = args.port or ports.get(name)
+    if not port:
+        what = f'{name}" monitor' if name else "Dasung monitor"
+        sys.exit(f"dasungctl: no {what} found on USB (is the monitor's USB cable connected?)")
+    if args.cmd in RANGES and args.value is not None and args.value not in RANGES[args.cmd]:
+        r = RANGES[args.cmd]
+        sys.exit(f"dasungctl: {args.cmd} must be {r.start}-{r.stop - 1}")
+    if args.cmd == "raw" and not (0 <= args.command <= 0xFF and 0 <= args.value <= 0xFF):
+        sys.exit("dasungctl: command and value must fit in a byte")
+
+    try:
+        mon = Monitor(port, args.debug)
+    except PermissionError:
+        sys.exit(f"dasungctl: no access to {port}, install 70-dasung.rules (see README)")
+    try:
+        if args.cmd == "info":
+            show_info(mon)
+        elif args.cmd == "tune":
+            tune(mon, name)
+        elif args.cmd == "brightness":
+            current = current_brightness(mon)
+            if args.value is None:
+                print(current)
+            else:
+                set_brightness(mon, name, target_level(current, args.value))
+        elif args.cmd == "light":
+            if args.value is None:
+                print(LIGHT_NAMES.get(mon.get(LIGHT), "unknown"))
+            else:
+                mode = LIGHT_MODES[args.value]
+                previous = mon.get(LIGHT) if mode == 0 else mode
+                if previous:
+                    remember_mode(name, previous)
+                mon.send(LIGHT, mode)
+        elif args.cmd in RANGES:
+            if args.value is None:
+                print(mon.get(PARAMS[args.cmd]))
+            else:
+                mon.send(PARAMS[args.cmd], args.value)
+        elif args.cmd == "refresh":
+            mon.send(REFRESH)
+        elif args.cmd == "raw":
+            mon.send(args.command, args.value)
+            for payload in mon.frames(args.wait):
+                print(payload.hex(" "))
+        elif args.cmd == "watch":
+            for payload in mon.frames():
+                print(time.strftime("%H:%M:%S"), payload.hex(" "), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mon.close()
+
+
+if __name__ == "__main__":
+    main()

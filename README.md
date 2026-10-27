@@ -1,0 +1,123 @@
+# dasungctl
+
+Control the front light and display settings of **Dasung Paperlike** e-ink monitors from Linux, in single
+brightness steps and below the darkest level the monitor's own buttons reach.
+
+The buttons on the tested 25.3" monitor move the front light in big jumps, and the dimmest setting they reach is
+10 %. Over USB the monitor accepts every value from 0 to 100, which is all it takes for a "just a little less"
+setting.
+
+## Tested monitors
+
+| Monitor | EDID name | `dasungctl info` |
+|---|---|---|
+| Paperlike 253 Color, 25.3" (2022) | `Paperlike253C` | MCU 31.11 |
+| Paperlike 13.3" with front light and touch (2024) | `Paperlike H D` | MCU 30.10 |
+
+Dasung's clients drive their other current models (Paperlike 253, 103, 13K) through the same code path, so they
+will probably work too, but nobody has tried yet.
+
+## Requirements
+
+- Linux with the `ch341` kernel module (part of every common distribution kernel)
+- Python 3.8 or newer, standard library only
+- the monitor's USB cable connected to the computer: on the 25.3" this is the **USB-B** port, which the official
+  client needs too; its USB-C port alone does not expose the control interface
+
+## Install
+
+```sh
+git clone https://github.com/jiri-one/dasungctl.git
+cd dasungctl
+install -Dm755 dasungctl ~/.local/bin/dasungctl
+sudo install -m644 70-dasung.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+```
+
+The udev rule lets the user at the seat open CH340 serial adapters, which the monitors use internally. udev cannot
+tell a Dasung's CH340 from any other, so the rule covers all of them. If you prefer, skip it and add yourself to
+the serial group instead (`uucp` on Arch, `dialout` on Debian and Ubuntu), then log in again.
+
+## Usage
+
+```sh
+dasungctl list                  # detected monitors and their serial ports
+dasungctl info                  # firmware version and current settings
+dasungctl brightness            # current front light brightness, 0 when the light is off
+dasungctl brightness 7          # set it; 0 switches the light off, anything else back on
+dasungctl brightness down       # one step down: by 1 up to 10, then in bigger steps
+dasungctl brightness +2         # or -2
+dasungctl light warm            # off, cold, warm or mixed
+dasungctl temperature 30        # colour of the mixed light, 0 warm to 100 cold
+dasungctl tune                  # adjust interactively with the arrow keys
+dasungctl contrast 5            # 1-9; also: speed 1-5, mode 2-7, refresh
+```
+
+Without `-m`, dasungctl uses the only Dasung connected, or the 25.3" one when there are two; pick the other with
+`-m 13`.
+`dasungctl tune` also shows the values the monitor's buttons set, so you can see their steps.
+
+## Key bindings
+
+[niri](https://github.com/niri-wm/niri):
+
+```kdl
+binds {
+    Mod+Insert repeat=false { spawn "dasungctl" "brightness" "down"; }
+    Mod+Backslash repeat=false { spawn "dasungctl" "brightness" "up"; }
+}
+```
+
+Sway:
+
+```
+bindsym $mod+Insert exec dasungctl brightness down
+bindsym $mod+backslash exec dasungctl brightness up
+```
+
+Use the full path if `~/.local/bin` is not in your compositor's `PATH`. Key repeat is off in the niri example
+because every step talks to the monitor; held keys would queue up steps that arrive after you let go.
+
+## How it works
+
+Dasung's official clients (Windows, macOS, and a small Linux tool published in 2023) control the monitors through a
+CH340 USB-serial converter on the monitor's internal USB hub. They send ASCII hex frames at 115200 baud, 8N1:
+
+```
+5FF5 CC VV 000000000000 A0FA      CC = command, VV = value
+```
+
+| Command | Meaning | Values |
+|---|---|---|
+| `01` | contrast | 1-9 |
+| `02` | image mode | 2-7, the meaning differs by model |
+| `03` | clear ghosting | 0 |
+| `04` | refresh speed | 1-5 |
+| `07` | front light | 0 off, 1 cold, 2 warm, 3 mixed |
+| `08` | colour temperature of the mixed light | 0 warm to 100 cold |
+| `09` | front light brightness | 0-100 |
+| `0A` | query parameter `VV` (`10` is the firmware version) | reply `5FF5 F0 0A VV value …` |
+
+The monitor acknowledges a setting with `F0 CC` and pushes a `CC value` frame whenever a value changes, including
+changes made with its buttons; `dasungctl watch` prints them. `dasungctl raw` sends any command, for exploring other
+models.
+
+dasungctl only talks to a CH340 that shares its hub with a CH341 (`1a86:5512`, the flash programmer both tested
+monitors carry), so it never sends frames to unrelated serial adapters. The monitor whose hub also holds the touch
+controller (`27c0:0818`) is the 13.3" one.
+
+## Firmware
+
+Dasung publishes no firmware for its monitors. The Windows client 2.0 can update the MCU and the FPGA (through the
+internal CH341), but it ships no firmware files, so new versions have to come from Dasung support. dasungctl never
+writes firmware.
+
+## Credits
+
+The frame format comes from Dasung's own Linux tool (`DS253.c` on [dasung.com](https://www.dasung.com/h-col-112.html)),
+[cpmetz/dasung253](https://github.com/cpmetz/dasung253) and
+[codefastdieyoung/paperlike-rs](https://github.com/codefastdieyoung/paperlike-rs). The front light commands, their
+ranges and the light modes were read from Dasung's Paperlike Client 2.0 for Windows and 2.0.3 for macOS, then
+checked on the monitors above.
+
+dasungctl is not affiliated with Dasung.
