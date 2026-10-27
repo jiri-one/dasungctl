@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Control the front light and display settings of Dasung Paperlike e-ink monitors."""
+# SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import fcntl
 import os
 import select
+import signal
 import sys
 import termios
 import time
 import tty
 from pathlib import Path
 
-DASUNG_VENDOR = "27c0"
+DESCRIPTION = "Control the front light and display settings of Dasung Paperlike e-ink monitors."
+
+DASUNG_TOUCH = "27c0"
+CH340_UART = ("1a86", "7523")
 CH341_SPI = ("1a86", "5512")
 
 CONTRAST, MODE, REFRESH, SPEED = 0x01, 0x02, 0x03, 0x04
@@ -27,67 +31,80 @@ PARAMS = {"contrast": CONTRAST, "mode": MODE, "speed": SPEED, "light": LIGHT,
 RANGES = {"contrast": range(1, 10), "mode": range(2, 8), "speed": range(1, 6),
           "temperature": range(0, 101)}
 
-# Perceived brightness is roughly logarithmic, so single steps only matter at the dark end.
-LADDER = [*range(1, 11), 12, 14, 16, 18, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100]
+EX_TEMPFAIL = 75
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "dasungctl"
 
 
-def usb_ids(hub):
-    ids = set()
-    for dev in hub.iterdir():
-        try:
-            ids.add(((dev / "idVendor").read_text().strip(),
-                     (dev / "idProduct").read_text().strip()))
-        except OSError:
-            pass
-    return ids
+class Busy(Exception):
+    pass
+
+
+def usb_id(dev):
+    try:
+        return (dev / "idVendor").read_text().strip(), (dev / "idProduct").read_text().strip()
+    except OSError:
+        return None
 
 
 def find_ports():
-    found = {}
+    found = []
     for tty_dir in sorted(Path("/sys/class/tty").glob("ttyUSB*")):
         try:
-            ids = usb_ids((tty_dir / "device").resolve().parents[2])
+            uart = (tty_dir / "device").resolve().parents[1]
+            siblings = {usb_id(dev) for dev in uart.parent.iterdir()}
         except (OSError, IndexError):
             continue
-        # Dasungs keep a CH341 flash programmer next to the UART; requiring it keeps frames
-        # away from other CH340 adapters, such as the one inside the BOOX Mira.
-        if CH341_SPI not in ids:
+        # Dasungs keep a CH341 flash programmer next to their CH340; requiring both keeps
+        # frames away from other serial adapters, such as the CH340 inside the BOOX Mira.
+        if usb_id(uart) != CH340_UART or CH341_SPI not in siblings:
             continue
         # Of the tested models only the 13.3" adds a touch controller to that hub.
-        name = "13" if any(vendor == DASUNG_VENDOR for vendor, _ in ids) else "253"
-        found.setdefault(name, f"/dev/{tty_dir.name}")
+        name = "13" if any(i and i[0] == DASUNG_TOUCH for i in siblings) else "253"
+        found.append((name, f"/dev/{tty_dir.name}"))
     return found
 
 
 class Monitor:
-    def __init__(self, path, debug=False):
+    def __init__(self, path, debug=False, wait=3.0):
         self.debug = debug
         self.pending = ""
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
-        # Key bindings can start several instances at once; their requests must not interleave.
-        deadline = time.monotonic() + 3
+        try:
+            self._lock(wait)
+            cc = termios.tcgetattr(self.fd)[6]
+            cc[termios.VMIN] = 0
+            cc[termios.VTIME] = 0
+            cflag = termios.CS8 | termios.CREAD | termios.CLOCAL
+            termios.tcsetattr(self.fd, termios.TCSANOW,
+                              [0, 0, cflag, 0, termios.B115200, termios.B115200, cc])
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def _lock(self, wait):
+        # Key bindings start an instance per key press; their requests must not interleave.
+        deadline = time.monotonic() + wait
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                return
             except BlockingIOError:
-                if time.monotonic() > deadline:
-                    os.close(self.fd)
-                    sys.exit(f"dasungctl: {path} is busy (is `dasungctl tune` or `watch` running?)")
-                time.sleep(0.05)
-        cc = termios.tcgetattr(self.fd)[6]
-        cc[termios.VMIN] = 0
-        cc[termios.VTIME] = 0
-        cflag = termios.CS8 | termios.CREAD | termios.CLOCAL
-        termios.tcsetattr(self.fd, termios.TCSANOW,
-                          [0, 0, cflag, 0, termios.B115200, termios.B115200, cc])
-        termios.tcflush(self.fd, termios.TCIOFLUSH)
+                if time.monotonic() >= deadline:
+                    raise Busy from None
+                time.sleep(0.02)
 
     def close(self):
-        termios.tcdrain(self.fd)
-        os.close(self.fd)
+        # After an unplug both calls fail; neither may hide the error that is being reported.
+        try:
+            termios.tcdrain(self.fd)
+        except termios.error:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
 
     def send(self, cmd, value=0):
         frame = f"5FF5{cmd:02X}{value & 0xFF:02X}{0:012X}A0FA"
@@ -96,13 +113,19 @@ class Monitor:
         os.write(self.fd, frame.encode())
 
     def read(self):
-        self.pending += os.read(self.fd, 256).decode("ascii", "replace").upper()
+        data = os.read(self.fd, 256)
+        if not data:
+            raise OSError("the monitor went away")
+        if self.debug:
+            # Raw rather than parsed, so frames of untested models show up too.
+            print(f"<< {data.decode('ascii', 'replace')}", file=sys.stderr)
+        self.pending += data.decode("ascii", "replace").upper()
 
     def parse(self):
         while True:
             i = self.pending.find("5FF5")
             if i < 0:
-                # Keep a possible partial prefix for the next read.
+                # A frame prefix can be split across reads.
                 self.pending = self.pending[-3:]
                 return
             if len(self.pending) - i < 24:
@@ -117,8 +140,6 @@ class Monitor:
                 self.pending = self.pending[i + 1:]
                 continue
             self.pending = self.pending[i + 24:]
-            if self.debug:
-                print(f"<< {frame}", file=sys.stderr)
             yield payload
 
     def frames(self, timeout=None):
@@ -132,13 +153,34 @@ class Monitor:
                 return
             self.read()
 
-    def query(self, param, timeout=1.0):
-        self.send(GET, param)
-        for payload in self.frames(timeout):
-            # Button presses and status pushes can arrive in between, so match the reply.
-            if payload[:3] == bytes([ACK, GET, param]):
-                return payload
+    def query(self, param):
+        # A frame that arrives while the monitor is still busy is dropped, so ask twice.
+        for _ in range(2):
+            self.send(GET, param)
+            for payload in self.frames(0.4):
+                # Button presses and status pushes can arrive in between, so match the reply.
+                if payload[:3] == bytes([ACK, GET, param]):
+                    return payload
         return None
+
+    def set(self, cmd, value=0):
+        others = []
+        for _ in range(2):
+            sent = time.monotonic()
+            self.send(cmd, value)
+            for payload in self.frames(0.4):
+                if payload[:2] == bytes([ACK, cmd]):
+                    break
+                others.append(payload)
+            else:
+                continue
+            if cmd == LIGHT:
+                # The monitor then reports the new light state for about 200 ms and drops
+                # whatever it receives meanwhile.
+                others += self.frames(sent + 0.3 - time.monotonic())
+            # Callers that track the state need the pushes that arrived meanwhile.
+            return others
+        sys.exit("dasungctl: the monitor did not confirm the change")
 
     def get(self, param):
         payload = self.query(param)
@@ -148,8 +190,11 @@ class Monitor:
 
 
 def remember_mode(name, mode):
-    STATE.mkdir(parents=True, exist_ok=True)
-    (STATE / f"light-{name}").write_text(f"{mode}\n")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        (STATE / f"light-{name}").write_text(f"{mode}\n")
+    except OSError as e:
+        print(f"dasungctl: cannot remember the light mode: {e.strerror}", file=sys.stderr)
 
 
 def remembered_mode(name):
@@ -160,81 +205,122 @@ def remembered_mode(name):
     return mode if mode in LIGHT_NAMES and mode else LIGHT_MODES["warm"]
 
 
-def current_brightness(mon):
-    return mon.get(BRIGHTNESS) if mon.get(LIGHT) else 0
-
-
-def set_brightness(mon, name, target):
-    """Brightness 0 switches the light off; anything above it switches it back on."""
-    mode = mon.get(LIGHT)
-    if target <= 0:
-        if mode:
-            remember_mode(name, mode)
-            mon.send(LIGHT, 0)
-        return
-    mon.send(BRIGHTNESS, target)
-    if not mode:
-        mon.send(LIGHT, remembered_mode(name))
-
-
 def level_arg(text):
-    if text in ("up", "down"):
-        return text
     try:
-        int(text)
+        value = int(text)
     except ValueError:
-        raise argparse.ArgumentTypeError("use 0-100, +N, -N, up or down") from None
+        value = None
+    if value is None or (text[0] not in "+-" and not 0 <= value <= 100):
+        raise argparse.ArgumentTypeError("use 0-100, +N or -N")
     return text
 
 
-def target_level(current, text):
-    if text == "up":
-        return next((v for v in LADDER if v > current), LADDER[-1])
-    if text == "down":
-        return next((v for v in reversed(LADDER) if v < current), 0)
+def byte_arg(text):
+    try:
+        value = int(text, 16)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 0xFF:
+        raise argparse.ArgumentTypeError("use two hex digits, such as 0A")
+    return value
+
+
+def brightness(mon, name, text):
+    mode = mon.get(LIGHT)
+    current = mon.get(BRIGHTNESS) if mode else 0
+    if text is None:
+        print(current)
+        return
     value = int(text)
-    return max(0, min(100, current + value if text[0] in "+-" else value))
+    target = max(0, min(100, current + value if text[0] in "+-" else value))
+    if target == current:
+        return
+    # Brightness 0 doubles as "off" so that one pair of keys covers the whole range.
+    if target == 0:
+        remember_mode(name, mode)
+        mon.set(LIGHT, 0)
+        return
+    mon.set(BRIGHTNESS, target)
+    if not mode:
+        mon.set(LIGHT, remembered_mode(name))
 
 
 def tune(mon, name):
+    if not sys.stdin.isatty():
+        sys.exit("dasungctl: tune needs a terminal")
     state = {p: mon.get(p) for p in (LIGHT, TEMPERATURE, BRIGHTNESS)}
     print(f'Dasung {name}": ←/→ brightness ±1   ↓/↑ temperature ±5   m light   q quit')
-    saved = termios.tcgetattr(sys.stdin)
-    tty.setcbreak(sys.stdin)
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+
+    def draw():
+        print(f"\r\x1b[Klight {LIGHT_NAMES.get(state[LIGHT], state[LIGHT]):6}"
+              f"  brightness {state[BRIGHTNESS]:3}  temperature {state[TEMPERATURE]:3}",
+              end="", flush=True)
+
+    def suspend(signum, frame):
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+        signal.signal(signal.SIGTSTP, suspend)
+        tty.setcbreak(fd)
+        draw()
+
+    # Without these the shell would inherit a terminal without echo.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(1))
+    signal.signal(signal.SIGTSTP, suspend)
+    keys = ""
+    done = False
     try:
-        while True:
-            print(f"\r\x1b[Klight {LIGHT_NAMES.get(state[LIGHT], state[LIGHT]):6}"
-                  f"  brightness {state[BRIGHTNESS]:3}  temperature {state[TEMPERATURE]:3}",
-                  end="", flush=True)
-            ready = select.select([sys.stdin, mon.fd], [], [])[0]
+        tty.setcbreak(fd)
+        while not done:
+            draw()
+            ready = select.select([fd, mon.fd], [], [])[0]
             if mon.fd in ready:
                 mon.read()
-                # The monitor pushes every change, button presses included, as [param, value].
+                # Changes made with the monitor's buttons arrive here too.
                 for payload in mon.parse():
                     if payload[0] in state:
                         state[payload[0]] = payload[1]
-            if sys.stdin not in ready:
+            if fd not in ready:
                 continue
-            key = os.read(sys.stdin.fileno(), 8).decode(errors="ignore")
-            if key in ("q", "\x1b"):
-                break
-            if key in ("\x1b[C", "\x1b[D"):
-                param, delta = BRIGHTNESS, 1 if key == "\x1b[C" else -1
-            elif key in ("\x1b[A", "\x1b[B"):
-                param, delta = TEMPERATURE, 5 if key == "\x1b[A" else -5
-            elif key == "m":
-                state[LIGHT] = (state[LIGHT] + 1) % 4
-                mon.send(LIGHT, state[LIGHT])
-                continue
-            else:
-                continue
-            state[param] = max(0, min(100, state[param] + delta))
-            mon.send(param, state[param])
+            keys += os.read(fd, 64).decode(errors="ignore")
+            changed = set()
+            while keys:
+                if keys[0] == "\x1b":
+                    if len(keys) < 3 and keys[1:] in ("", "[", "O"):
+                        break  # the rest of an arrow key is still on its way
+                    key, keys = (keys[:3], keys[3:]) if keys[1] in "[O" else ("", keys[1:])
+                else:
+                    key, keys = keys[0], keys[1:]
+                if key == "q":
+                    done = True
+                    break
+                if key[1:] in ("[C", "OC", "[D", "OD"):
+                    param, delta = BRIGHTNESS, 1 if key[2] == "C" else -1
+                elif key[1:] in ("[A", "OA", "[B", "OB"):
+                    param, delta = TEMPERATURE, 5 if key[2] == "A" else -5
+                elif key == "m":
+                    param, delta = LIGHT, None
+                else:
+                    continue
+                if delta is None:
+                    state[LIGHT] = (state[LIGHT] + 1) % 4
+                else:
+                    state[param] = max(0, min(100, state[param] + delta))
+                changed.add(param)
+            # A held arrow key delivers several steps per read; the steps in between need not
+            # reach the monitor.
+            for param in sorted(changed):
+                for payload in mon.set(param, state[param]):
+                    if payload[0] in state:
+                        state[payload[0]] = payload[1]
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
         print()
-    if state[LIGHT]:
-        remember_mode(name, state[LIGHT])
+        if state[LIGHT]:
+            remember_mode(name, state[LIGHT])
 
 
 def show_info(mon):
@@ -249,8 +335,21 @@ def show_info(mon):
         print(f"{name:11} {value}")
 
 
+def pick(found, monitor):
+    candidates = [(n, p) for n, p in found if monitor in (None, n)]
+    if monitor is None and len({n for n, _ in candidates}) > 1:
+        candidates = [(n, p) for n, p in candidates if n == "253"]
+    if not candidates:
+        what = f'{monitor}" monitor' if monitor else "Dasung monitor"
+        sys.exit(f"dasungctl: no {what} found on USB (is the monitor's USB cable connected?)")
+    if len(candidates) > 1:
+        ports = ", ".join(p for _, p in candidates)
+        sys.exit(f"dasungctl: several matching monitors ({ports}), pick one with --port")
+    return candidates[0]
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="dasungctl", description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="dasungctl", description=DESCRIPTION)
     ap.add_argument("-m", "--monitor", choices=["253", "13"],
                     help='25.3" or 13.3" model (default: the only one connected, else 253)')
     ap.add_argument("--port", help="serial device instead of autodetection")
@@ -260,54 +359,64 @@ def main():
     sub.add_parser("info", help="show firmware version and settings")
     sub.add_parser("tune", help="adjust the front light with the arrow keys")
     sub.add_parser("brightness", help="front light brightness; 0 switches the light off").add_argument(
-        "value", nargs="?", type=level_arg, help="0-100, +N, -N, up or down")
+        "value", nargs="?", type=level_arg,
+        help="0-100, or +N/-N relative; a relative step is skipped while another dasungctl "
+             "talks to the monitor, so held keys never queue up")
     sub.add_parser("light", help="front light colour").add_argument(
         "value", nargs="?", choices=list(LIGHT_MODES))
-    sub.add_parser("temperature", help="colour temperature of mixed light, 0 warm to 100 cold"
-                   ).add_argument("value", type=int, nargs="?")
-    sub.add_parser("contrast", help="1-9").add_argument("value", type=int, nargs="?")
-    sub.add_parser("mode", help="image mode, 2-7 (meaning differs by model)").add_argument(
-        "value", type=int, nargs="?")
-    sub.add_parser("speed", help="refresh speed, 1-5").add_argument("value", type=int, nargs="?")
+    sub.add_parser("temperature", help="colour temperature of mixed light").add_argument(
+        "value", type=int, nargs="?", help="0 warm to 100 cold")
+    sub.add_parser("contrast", help="contrast").add_argument(
+        "value", type=int, nargs="?", help="1-9")
+    sub.add_parser("mode", help="image mode").add_argument(
+        "value", type=int, nargs="?", help="2-7, the meaning differs by model")
+    sub.add_parser("speed", help="refresh speed").add_argument(
+        "value", type=int, nargs="?", help="1-5")
     sub.add_parser("refresh", help="clear ghosting")
     raw = sub.add_parser("raw", help="send any command and print the replies (protocol research)")
-    raw.add_argument("command", type=lambda s: int(s, 0))
-    raw.add_argument("value", type=lambda s: int(s, 0), nargs="?", default=0)
+    raw.add_argument("command", type=byte_arg, help="hex, such as 0A")
+    raw.add_argument("value", type=byte_arg, nargs="?", default=0, help="hex, default 00")
     raw.add_argument("--wait", type=float, default=1.0, help="seconds to wait for replies")
     sub.add_parser("watch", help="print the frames the monitor sends")
     args = ap.parse_args()
 
-    ports = find_ports()
+    found = find_ports()
     if args.cmd == "list":
-        for name, port in sorted(ports.items()):
+        if not found:
+            sys.exit("dasungctl: no Dasung monitor found on USB")
+        for name, port in found:
             print(f'{name}"  {port}')
         return
-    name = args.monitor or ("253" if "253" in ports or args.port else next(iter(ports), None))
-    port = args.port or ports.get(name)
-    if not port:
-        what = f'{name}" monitor' if name else "Dasung monitor"
-        sys.exit(f"dasungctl: no {what} found on USB (is the monitor's USB cable connected?)")
+    if args.port:
+        port = args.port
+        real = os.path.realpath(port)
+        name = args.monitor or next((n for n, p in found if p == real), "custom")
+    else:
+        name, port = pick(found, args.monitor)
     if args.cmd in RANGES and args.value is not None and args.value not in RANGES[args.cmd]:
         r = RANGES[args.cmd]
         sys.exit(f"dasungctl: {args.cmd} must be {r.start}-{r.stop - 1}")
-    if args.cmd == "raw" and not (0 <= args.command <= 0xFF and 0 <= args.value <= 0xFF):
-        sys.exit("dasungctl: command and value must fit in a byte")
 
+    relative = args.cmd == "brightness" and args.value is not None and args.value[0] in "+-"
     try:
-        mon = Monitor(port, args.debug)
+        mon = Monitor(port, args.debug, wait=0 if relative else 3.0)
+    except Busy:
+        print(f"dasungctl: {port} is busy, step skipped" if relative else
+              f"dasungctl: {port} is busy (is `dasungctl tune` or `watch` running?)", file=sys.stderr)
+        sys.exit(EX_TEMPFAIL)
     except PermissionError:
         sys.exit(f"dasungctl: no access to {port}, install 70-dasung.rules (see README)")
+    except OSError as e:
+        sys.exit(f"dasungctl: cannot open {port}: {e.strerror}")
+    except termios.error:
+        sys.exit(f"dasungctl: {port} is not a serial port")
     try:
         if args.cmd == "info":
             show_info(mon)
         elif args.cmd == "tune":
             tune(mon, name)
         elif args.cmd == "brightness":
-            current = current_brightness(mon)
-            if args.value is None:
-                print(current)
-            else:
-                set_brightness(mon, name, target_level(current, args.value))
+            brightness(mon, name, args.value)
         elif args.cmd == "light":
             if args.value is None:
                 print(LIGHT_NAMES.get(mon.get(LIGHT), "unknown"))
@@ -316,14 +425,14 @@ def main():
                 previous = mon.get(LIGHT) if mode == 0 else mode
                 if previous:
                     remember_mode(name, previous)
-                mon.send(LIGHT, mode)
+                mon.set(LIGHT, mode)
         elif args.cmd in RANGES:
             if args.value is None:
                 print(mon.get(PARAMS[args.cmd]))
             else:
-                mon.send(PARAMS[args.cmd], args.value)
+                mon.set(PARAMS[args.cmd], args.value)
         elif args.cmd == "refresh":
-            mon.send(REFRESH)
+            mon.set(REFRESH)
         elif args.cmd == "raw":
             mon.send(args.command, args.value)
             for payload in mon.frames(args.wait):
@@ -333,6 +442,8 @@ def main():
                 print(time.strftime("%H:%M:%S"), payload.hex(" "), flush=True)
     except KeyboardInterrupt:
         pass
+    except OSError as e:
+        sys.exit(f"dasungctl: lost the connection to {port}: {e.strerror or e}")
     finally:
         mon.close()
 

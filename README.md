@@ -45,8 +45,7 @@ dasungctl list                  # detected monitors and their serial ports
 dasungctl info                  # firmware version and current settings
 dasungctl brightness            # current front light brightness, 0 when the light is off
 dasungctl brightness 7          # set it; 0 switches the light off, anything else back on
-dasungctl brightness down       # one step down: by 1 up to 10, then in bigger steps
-dasungctl brightness +2         # or -2
+dasungctl brightness -1         # one step darker; +1 one step brighter, +5 five steps
 dasungctl light warm            # off, cold, warm or mixed
 dasungctl temperature 30        # colour of the mixed light, 0 warm to 100 cold
 dasungctl tune                  # adjust interactively with the arrow keys
@@ -54,7 +53,9 @@ dasungctl contrast 5            # 1-9; also: speed 1-5, mode 2-7, refresh
 ```
 
 Without `-m`, dasungctl uses the only Dasung connected, or the 25.3" one when there are two; pick the other with
-`-m 13`.
+`-m 13` before the command, as in `dasungctl -m 13 brightness -1`. Two monitors of the same model have to be told
+apart with `--port`; the links in `/dev/serial/by-path/` stay put across reboots, unlike `/dev/ttyUSB*`.
+
 `dasungctl tune` also shows the values the monitor's buttons set, so you can see their steps.
 
 ## Key bindings
@@ -63,25 +64,27 @@ Without `-m`, dasungctl uses the only Dasung connected, or the 25.3" one when th
 
 ```kdl
 binds {
-    Mod+Insert repeat=false { spawn "dasungctl" "brightness" "down"; }
-    Mod+Backslash repeat=false { spawn "dasungctl" "brightness" "up"; }
+    Mod+Insert { spawn "dasungctl" "brightness" "-1"; }
+    Mod+Backslash { spawn "dasungctl" "brightness" "+1"; }
 }
 ```
 
 Sway:
 
 ```
-bindsym $mod+Insert exec dasungctl brightness down
-bindsym $mod+backslash exec dasungctl brightness up
+bindsym $mod+Insert exec dasungctl brightness -1
+bindsym $mod+backslash exec dasungctl brightness +1
 ```
 
-Use the full path if `~/.local/bin` is not in your compositor's `PATH`. Key repeat is off in the niri example
-because every step talks to the monitor; held keys would queue up steps that arrive after you let go.
+A press is one step, and a held key keeps stepping at the keyboard's repeat rate. A relative step that starts
+while another dasungctl is still talking to the monitor is skipped, so nothing keeps changing after you let go.
+Use the full path if `~/.local/bin` is not in your compositor's `PATH`.
 
 ## How it works
 
-Dasung's official clients (Windows, macOS, and a small Linux tool published in 2023) control the monitors through a
-CH340 USB-serial converter on the monitor's internal USB hub. They send ASCII hex frames at 115200 baud, 8N1:
+Dasung's official clients (Windows, macOS, and a small Linux tool from 2021 that their site has offered since 2023)
+control the monitors through a CH340 USB-serial converter on the monitor's internal USB hub. They send ASCII hex
+frames at 115200 baud, 8N1:
 
 ```
 5FF5 CC VV 000000000000 A0FA      CC = command, VV = value
@@ -98,13 +101,15 @@ CH340 USB-serial converter on the monitor's internal USB hub. They send ASCII he
 | `09` | front light brightness | 0-100 |
 | `0A` | query parameter `VV` (`10` is the firmware version) | reply `5FF5 F0 0A VV value …` |
 
-The monitor acknowledges a setting with `F0 CC` and pushes a `CC value` frame whenever a value changes, including
-changes made with its buttons; `dasungctl watch` prints them. `dasungctl raw` sends any command, for exploring other
-models.
+The monitor acknowledges a setting with `F0 CC` about 20 ms later and drops any frame that arrives before that, so
+dasungctl waits for each acknowledgement. After a front light change it reports the new state for about 200 ms and
+drops frames meanwhile too. It also pushes a `CC value` frame whenever a value changes, including changes made with
+its buttons. For exploring other models, `dasungctl watch` prints what the monitor sends and `dasungctl raw` sends
+any command, both numbers in hex as in the table: `dasungctl raw 0A 10` asks for the firmware version.
 
-dasungctl only talks to a CH340 that shares its hub with a CH341 (`1a86:5512`, the flash programmer both tested
-monitors carry), so it never sends frames to unrelated serial adapters. The monitor whose hub also holds the touch
-controller (`27c0:0818`) is the 13.3" one.
+Autodetection only considers a CH340 (`1a86:7523`) that shares its hub with a CH341 (`1a86:5512`, the flash
+programmer both tested monitors carry), so frames do not go to unrelated serial adapters unless you name one with
+`--port`. The monitor whose hub also holds the touch controller (`27c0:0818`) is the 13.3" one.
 
 ## Firmware
 
@@ -121,3 +126,7 @@ ranges and the light modes were read from Dasung's Paperlike Client 2.0 for Wind
 checked on the monitors above.
 
 dasungctl is not affiliated with Dasung.
+
+## License
+
+[GPL-3.0-or-later](LICENSE)
