@@ -7,15 +7,23 @@ The buttons on the tested 25.3" monitor move the front light in big jumps, and t
 10 %. Over USB the monitor accepts every value from 0 to 100, which is all it takes for a "just a little less"
 setting.
 
-## Tested monitors
+## Tested on
 
-| Monitor | EDID name | `dasungctl info` |
-|---|---|---|
-| Paperlike 253 Color, 25.3" (2022) | `Paperlike253C` | MCU 31.11 |
-| Paperlike 13.3" with front light and touch (2024) | `Paperlike H D` | MCU 30.10 |
+dasungctl has been tested on exactly these two monitors, both at the same time on one computer:
+
+| Monitor | Made | Reports itself as | Firmware (`dasungctl info`) | Connected by |
+|---|---|---|---|---|
+| Dasung Paperlike Color, 25.3" | 2022 | EDID `DSC Paperlike253C`; no touch controller on USB | MCU 31.11 | DisplayPort + USB-B |
+| Dasung Paperlike 13.3" with front light and touch | 2024 | EDID `DSC Paperlike H D`; touch controller `27c0:0818` | MCU 30.10 | HDMI + USB |
+
+Brightness, light colour, `tune`, and key bindings with held keys and notifications were used on both. Contrast,
+refresh speed and clearing ghosting were tried on the 13.3" only; image mode and colour temperature are sent the
+way the official clients send them but have not been tried. The computer ran Manjaro Linux with kernel 6.18,
+niri 26.04, mako 1.11 and Python 3.14; nothing in dasungctl is specific to that setup.
 
 Dasung's clients drive their other current models (Paperlike 253, 103, 13K) through the same code path, so they
-will probably work too, but nobody has tried yet.
+will probably work too, but nobody has tried yet. If you have one, `dasungctl info` and an issue with the output
+are very welcome.
 
 ## Requirements
 
