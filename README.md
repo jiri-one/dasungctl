@@ -21,6 +21,7 @@ will probably work too, but nobody has tried yet.
 
 - Linux with the `ch341` kernel module (part of every common distribution kernel)
 - Python 3.8 or newer, standard library only
+- for `--notify`: `notify-send` (libnotify) and a notification daemon such as mako or dunst
 - the monitor's USB cable connected to the computer: on the 25.3" this is the **USB-B** port, which the official
   client needs too; its USB-C port alone does not expose the control interface
 
@@ -64,20 +65,25 @@ apart with `--port`; the links in `/dev/serial/by-path/` stay put across reboots
 
 ```kdl
 binds {
-    Mod+Insert { spawn "dasungctl" "brightness" "-1"; }
-    Mod+Backslash { spawn "dasungctl" "brightness" "+1"; }
+    Mod+Insert { spawn "dasungctl" "--notify" "brightness" "-1"; }
+    Mod+Backslash { spawn "dasungctl" "--notify" "brightness" "+1"; }
 }
 ```
 
 Sway:
 
 ```
-bindsym $mod+Insert exec dasungctl brightness -1
-bindsym $mod+backslash exec dasungctl brightness +1
+bindsym $mod+Insert exec dasungctl --notify brightness -1
+bindsym $mod+backslash exec dasungctl --notify brightness +1
 ```
 
 A press is one step, and a held key keeps stepping at the keyboard's repeat rate. A relative step that starts
 while another dasungctl is still talking to the monitor is skipped, so nothing keeps changing after you let go.
+
+With `--notify`, each step shows the new level in a desktop notification. It replaces the previous one instead of
+stacking up, so a held key leaves a single notification that ends on the real value. Errors such as an unplugged
+monitor appear there too, since nothing a key binding prints reaches the screen.
+
 Use the full path if `~/.local/bin` is not in your compositor's `PATH`.
 
 ## How it works

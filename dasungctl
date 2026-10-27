@@ -5,6 +5,7 @@ import fcntl
 import os
 import select
 import signal
+import subprocess
 import sys
 import termios
 import time
@@ -34,9 +35,16 @@ RANGES = {"contrast": range(1, 10), "mode": range(2, 8), "speed": range(1, 6),
 EX_TEMPFAIL = 75
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "dasungctl"
+RUNTIME = Path(os.environ["XDG_RUNTIME_DIR"]) / "dasungctl" if os.environ.get("XDG_RUNTIME_DIR") else None
+
+LABELS = {"253": 'Dasung 25.3"', "13": 'Dasung 13.3"'}
 
 
 class Busy(Exception):
+    pass
+
+
+class Error(Exception):
     pass
 
 
@@ -180,12 +188,12 @@ class Monitor:
                 others += self.frames(sent + 0.3 - time.monotonic())
             # Callers that track the state need the pushes that arrived meanwhile.
             return others
-        sys.exit("dasungctl: the monitor did not confirm the change")
+        raise Error("the monitor did not confirm the change")
 
     def get(self, param):
         payload = self.query(param)
         if payload is None:
-            sys.exit("dasungctl: the monitor did not answer")
+            raise Error("the monitor did not answer")
         return payload[3]
 
 
@@ -230,24 +238,55 @@ def brightness(mon, name, text):
     current = mon.get(BRIGHTNESS) if mode else 0
     if text is None:
         print(current)
-        return
+        return current
     value = int(text)
     target = max(0, min(100, current + value if text[0] in "+-" else value))
     if target == current:
-        return
+        return current
     # Brightness 0 doubles as "off" so that one pair of keys covers the whole range.
     if target == 0:
         remember_mode(name, mode)
         mon.set(LIGHT, 0)
-        return
+        return 0
     mon.set(BRIGHTNESS, target)
     if not mode:
         mon.set(LIGHT, remembered_mode(name))
+    return target
+
+
+def notify(title, body, slot, *, error=False):
+    # notify-send only stacks notifications; replacing the previous one by its id keeps a
+    # single notification per monitor that just changes its text.
+    id_file = RUNTIME / f"notification-{slot}" if RUNTIME else None
+    try:
+        previous = int(id_file.read_text()) if id_file else 0
+    except (OSError, ValueError):
+        previous = 0
+    cmd = ["notify-send", "--app-name=dasungctl", "--print-id",
+           f"--expire-time={5000 if error else 2000}"]
+    if not error:
+        cmd.append("--transient")
+    if previous:
+        cmd.append(f"--replace-id={previous}")
+    try:
+        new = subprocess.run([*cmd, title, body], capture_output=True, text=True,
+                             timeout=1).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return
+    # The daemon hands out a new id once the old notification has expired.
+    if id_file and new.isdigit() and int(new) != previous:
+        try:
+            id_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = id_file.with_name(f"{id_file.name}.{os.getpid()}")
+            tmp.write_text(new)
+            os.replace(tmp, id_file)
+        except OSError:
+            pass
 
 
 def tune(mon, name):
     if not sys.stdin.isatty():
-        sys.exit("dasungctl: tune needs a terminal")
+        raise Error("tune needs a terminal")
     state = {p: mon.get(p) for p in (LIGHT, TEMPERATURE, BRIGHTNESS)}
     print(f'Dasung {name}": ←/→ brightness ±1   ↓/↑ temperature ±5   m light   q quit')
     fd = sys.stdin.fileno()
@@ -341,11 +380,76 @@ def pick(found, monitor):
         candidates = [(n, p) for n, p in candidates if n == "253"]
     if not candidates:
         what = f'{monitor}" monitor' if monitor else "Dasung monitor"
-        sys.exit(f"dasungctl: no {what} found on USB (is the monitor's USB cable connected?)")
+        raise Error(f"no {what} found on USB (is the monitor's USB cable connected?)")
     if len(candidates) > 1:
         ports = ", ".join(p for _, p in candidates)
-        sys.exit(f"dasungctl: several matching monitors ({ports}), pick one with --port")
+        raise Error(f"several matching monitors ({ports}), pick one with --port")
     return candidates[0]
+
+
+def command(mon, args, name):
+    if args.cmd == "info":
+        show_info(mon)
+    elif args.cmd == "tune":
+        tune(mon, name)
+    elif args.cmd == "brightness":
+        level = brightness(mon, name, args.value)
+        return f"Brightness {level} %" if level else "Front light off"
+    elif args.cmd == "light":
+        if args.value is None:
+            print(LIGHT_NAMES.get(mon.get(LIGHT), "unknown"))
+            return None
+        mode = LIGHT_MODES[args.value]
+        previous = mon.get(LIGHT) if mode == 0 else mode
+        if previous:
+            remember_mode(name, previous)
+        mon.set(LIGHT, mode)
+        return f"Front light {args.value}"
+    elif args.cmd in RANGES:
+        if args.value is None:
+            print(mon.get(PARAMS[args.cmd]))
+            return None
+        mon.set(PARAMS[args.cmd], args.value)
+        return f"{args.cmd.capitalize()} {args.value}"
+    elif args.cmd == "refresh":
+        mon.set(REFRESH)
+    elif args.cmd == "raw":
+        mon.send(args.command, args.value)
+        for payload in mon.frames(args.wait):
+            print(payload.hex(" "))
+    elif args.cmd == "watch":
+        for payload in mon.frames():
+            print(time.strftime("%H:%M:%S"), payload.hex(" "), flush=True)
+    return None
+
+
+def run(args, name, port):
+    relative = args.cmd == "brightness" and args.value is not None and args.value[0] in "+-"
+    try:
+        mon = Monitor(port, args.debug, wait=0 if relative else 3.0)
+    except Busy:
+        if relative:
+            print(f"dasungctl: {port} is busy, step skipped", file=sys.stderr)
+            sys.exit(EX_TEMPFAIL)
+        raise Error(f"{port} is busy (is `dasungctl tune` or `watch` running?)") from None
+    except PermissionError:
+        raise Error(f"no access to {port}, install 70-dasung.rules (see README)") from None
+    except OSError as e:
+        raise Error(f"cannot open {port}: {e.strerror}") from None
+    except termios.error:
+        raise Error(f"{port} is not a serial port") from None
+    try:
+        text = command(mon, args, name)
+        if text and args.notify:
+            # Sent while the port is still locked, so the notifications of quick steps cannot
+            # overtake each other and leave a stale value on screen.
+            notify(LABELS.get(name, "Dasung"), text, name)
+    except KeyboardInterrupt:
+        pass
+    except OSError as e:
+        raise Error(f"lost the connection to {port}: {e.strerror or e}") from None
+    finally:
+        mon.close()
 
 
 def main():
@@ -353,6 +457,8 @@ def main():
     ap.add_argument("-m", "--monitor", choices=["253", "13"],
                     help='25.3" or 13.3" model (default: the only one connected, else 253)')
     ap.add_argument("--port", help="serial device instead of autodetection")
+    ap.add_argument("--notify", action="store_true",
+                    help="show changes and errors as a desktop notification, e.g. from key bindings")
     ap.add_argument("--debug", action="store_true", help="print raw frames")
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
     sub.add_parser("list", help="show detected monitors")
@@ -380,72 +486,31 @@ def main():
     sub.add_parser("watch", help="print the frames the monitor sends")
     args = ap.parse_args()
 
-    found = find_ports()
-    if args.cmd == "list":
-        if not found:
-            sys.exit("dasungctl: no Dasung monitor found on USB")
-        for name, port in found:
-            print(f'{name}"  {port}')
-        return
-    if args.port:
-        port = args.port
-        real = os.path.realpath(port)
-        name = args.monitor or next((n for n, p in found if p == real), "custom")
-    else:
-        name, port = pick(found, args.monitor)
-    if args.cmd in RANGES and args.value is not None and args.value not in RANGES[args.cmd]:
-        r = RANGES[args.cmd]
-        sys.exit(f"dasungctl: {args.cmd} must be {r.start}-{r.stop - 1}")
-
-    relative = args.cmd == "brightness" and args.value is not None and args.value[0] in "+-"
+    name = args.monitor or "dasung"
     try:
-        mon = Monitor(port, args.debug, wait=0 if relative else 3.0)
-    except Busy:
-        print(f"dasungctl: {port} is busy, step skipped" if relative else
-              f"dasungctl: {port} is busy (is `dasungctl tune` or `watch` running?)", file=sys.stderr)
-        sys.exit(EX_TEMPFAIL)
-    except PermissionError:
-        sys.exit(f"dasungctl: no access to {port}, install 70-dasung.rules (see README)")
-    except OSError as e:
-        sys.exit(f"dasungctl: cannot open {port}: {e.strerror}")
-    except termios.error:
-        sys.exit(f"dasungctl: {port} is not a serial port")
-    try:
-        if args.cmd == "info":
-            show_info(mon)
-        elif args.cmd == "tune":
-            tune(mon, name)
-        elif args.cmd == "brightness":
-            brightness(mon, name, args.value)
-        elif args.cmd == "light":
-            if args.value is None:
-                print(LIGHT_NAMES.get(mon.get(LIGHT), "unknown"))
-            else:
-                mode = LIGHT_MODES[args.value]
-                previous = mon.get(LIGHT) if mode == 0 else mode
-                if previous:
-                    remember_mode(name, previous)
-                mon.set(LIGHT, mode)
-        elif args.cmd in RANGES:
-            if args.value is None:
-                print(mon.get(PARAMS[args.cmd]))
-            else:
-                mon.set(PARAMS[args.cmd], args.value)
-        elif args.cmd == "refresh":
-            mon.set(REFRESH)
-        elif args.cmd == "raw":
-            mon.send(args.command, args.value)
-            for payload in mon.frames(args.wait):
-                print(payload.hex(" "))
-        elif args.cmd == "watch":
-            for payload in mon.frames():
-                print(time.strftime("%H:%M:%S"), payload.hex(" "), flush=True)
-    except KeyboardInterrupt:
-        pass
-    except OSError as e:
-        sys.exit(f"dasungctl: lost the connection to {port}: {e.strerror or e}")
-    finally:
-        mon.close()
+        found = find_ports()
+        if args.cmd == "list":
+            if not found:
+                raise Error("no Dasung monitor found on USB")
+            for monitor, port in found:
+                print(f'{monitor}"  {port}')
+            return
+        if args.port:
+            port = args.port
+            real = os.path.realpath(port)
+            name = args.monitor or next((n for n, p in found if p == real), "custom")
+        else:
+            name, port = pick(found, args.monitor)
+        if args.cmd in RANGES and args.value is not None and args.value not in RANGES[args.cmd]:
+            r = RANGES[args.cmd]
+            raise Error(f"{args.cmd} must be {r.start}-{r.stop - 1}")
+        run(args, name, port)
+    except Error as e:
+        # Like any CLI on stderr; from a key binding only the notification is ever seen.
+        print(f"dasungctl: {e}", file=sys.stderr)
+        if args.notify:
+            notify(f"{LABELS.get(name, 'Dasung')} error", str(e), name, error=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
