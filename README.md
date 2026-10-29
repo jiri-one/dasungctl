@@ -7,6 +7,9 @@ The buttons on the tested 25.3" monitor move the front light in big jumps, and t
 10 %. Over USB the monitor accepts every value from 0 to 100, which is all it takes for a "just a little less"
 setting.
 
+With an ambient light sensor, dasungctl can also [follow the room light](#automatic-brightness), having learned
+from your own changes how bright you like it.
+
 ## Tested on
 
 dasungctl has been tested on exactly these two monitors, both at the same time on one computer:
@@ -18,7 +21,8 @@ dasungctl has been tested on exactly these two monitors, both at the same time o
 
 Brightness, light colour, `tune`, and key bindings with held keys and notifications were used on both. Contrast,
 refresh speed and clearing ghosting were tried on the 13.3" only; image mode and colour temperature are sent the
-way the official clients send them but have not been tried. The computer ran Manjaro Linux with kernel 6.18,
+way the official clients send them but have not been tried. Automatic brightness runs on the 25.3" with a BH1750
+light sensor on a Devantech USB-I2C adapter (firmware 9). The computer ran Manjaro Linux with kernel 6.18,
 niri 26.04, mako 1.11 and Python 3.14; nothing in dasungctl is specific to that setup.
 
 Dasung's clients drive their other current models (Paperlike 253, 103, 13K) through the same code path, so they
@@ -32,6 +36,8 @@ are very welcome.
 - for `--notify`: `notify-send` (libnotify) and a notification daemon such as mako or dunst
 - the monitor's USB cable connected to the computer: on the 25.3" this is the **USB-B** port, which the official
   client needs too; its USB-C port alone does not expose the control interface
+- for automatic brightness: a BH1750 light sensor on a Devantech USB-I2C adapter, and a way to keep
+  `dasungctl auto daemon` running, such as the systemd user service below
 
 ## Install
 
@@ -59,11 +65,19 @@ dasungctl light warm            # off, cold, warm or mixed
 dasungctl temperature 30        # colour of the mixed light, 0 warm to 100 cold
 dasungctl tune                  # adjust interactively with the arrow keys
 dasungctl contrast 5            # 1-9; also: speed 1-5, mode 2-7, refresh
+dasungctl lux                   # the room light in lux, from an ambient light sensor
+dasungctl auto                  # what automatic brightness has learned; auto on, auto off
+dasungctl watch                 # print the frames the monitor sends
+dasungctl raw 0A 10             # send any command in hex and print the replies
 ```
 
 Without `-m`, dasungctl uses the only Dasung connected, or the 25.3" one when there are two; pick the other with
 `-m 13` before the command, as in `dasungctl -m 13 brightness -1`. Two monitors of the same model have to be told
 apart with `--port`; the links in `/dev/serial/by-path/` stay put across reboots, unlike `/dev/ttyUSB*`.
+
+`--notify` shows each change as a desktop notification (see [Key bindings](#key-bindings)) and `--debug` prints
+the raw frames. `lux` and `auto` need an ambient light sensor, which `--sensor` can name; see
+[Automatic brightness](#automatic-brightness).
 
 `dasungctl tune` also shows the values the monitor's buttons set, so you can see their steps.
 
@@ -93,6 +107,68 @@ stacking up, so a held key leaves a single notification that ends on the real va
 monitor appear there too, since nothing a key binding prints reaches the screen.
 
 Use the full path if `~/.local/bin` is not in your compositor's `PATH`.
+
+## Automatic brightness
+
+With an ambient light sensor, dasungctl sets the front light from the room light. It comes with no brightness
+curve of its own: it learns one from the changes you make yourself, and you switch it on once it has seen enough
+of them.
+
+The tested sensor is a BH1750 breakout (such as the GY-302) on a
+[Devantech USB-I2C](https://www.robot-electronics.co.uk/htm/usb_i2c_tech.htm) adapter, mounted on the monitor.
+Give your user access to the adapter and start the daemon as a systemd user service:
+
+```sh
+sudo install -m644 71-usb-i2c.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+install -Dm644 dasungctl-auto.service ~/.config/systemd/user/dasungctl-auto.service
+systemctl --user enable --now dasungctl-auto
+```
+
+```sh
+dasungctl lux                   # the room light in lux
+dasungctl auto                  # what has been learned so far
+dasungctl auto on               # set the brightness from the room light, never above 10
+dasungctl auto on --max 8       # ... or never above 8
+dasungctl auto off              # only learn again
+```
+
+`auto` takes `-m` like the other commands; each monitor learns and switches on separately. It tells monitors apart
+by model, so it cannot drive two monitors of the same model.
+
+While the daemon runs, every brightness you set with dasungctl, whether from a key binding, `tune` or the command
+line, is stored together with the room light in `~/.local/state/dasungctl/choices-253.tsv` (`choices-13.tsv` for
+the 13.3"). Steps less than 30 seconds apart, as from a held key, count as one choice: the level you ended on.
+Learning never changes the brightness, so give it a week or two of your usual days and evenings, then look at
+`dasungctl auto`:
+
+```
+Dasung 25.3": automatic brightness off, only learning
+Learned from 3 changes, 20 Oct 20:00 to 29 Oct 08:38.
+Light now 54 lx, learned brightness for it 5.5.
+
+    lux  brightness     changes
+      0   5.5  █████▌
+     ...
+     50   5.5  █████▌         2  ← now
+    100   5.4  █████▌
+    200   3.8  ███▊
+    500   1.6  █▋
+   1000   0.0
+   2000   0.0                 1
+     ...
+```
+
+At a light level where you have chosen, the curve follows what you chose there, your newest choice outweighing all
+older ones at that level at least nine to one; between such levels it runs straight on a logarithmic lux scale, and
+beyond the darkest and the brightest of them it stays flat.
+
+Once switched on, the daemon smooths the light over about 20 seconds and moves the brightness one step every two
+seconds, and only when the learned value has moved at least 0.75 away from the current level, so it never
+flickers between two levels. A brightness you set yourself while it is on is a correction: it is learned at once,
+and the daemon leaves your level alone until the room light changes by a factor of about 1.4. A key press that
+comes while the daemon is taking a step waits for it instead of being skipped. The monitor's buttons count as well,
+although the daemon only notices them when it next wants to change the brightness.
 
 ## How it works
 
@@ -124,6 +200,17 @@ any command, both numbers in hex as in the table: `dasungctl raw 0A 10` asks for
 Autodetection only considers a CH340 (`1a86:7523`) that shares its hub with a CH341 (`1a86:5512`, the flash
 programmer both tested monitors carry), so frames do not go to unrelated serial adapters unless you name one with
 `--port`. The monitor whose hub also holds the touch controller (`27c0:0818`) is the 13.3" one.
+
+The Devantech USB-I2C adapter is a stock FT232R (`0403:6001`) that takes I2C transactions at 19200 baud, 8N2:
+`53 address byte` writes a byte, `54 address count` reads bytes. dasungctl uses the only FT232R on USB, checks that
+it answers like the adapter and that a BH1750 acknowledges at 0x23 or 0x5C; with other FT232R adapters connected,
+name it with `--sensor /dev/serial/by-id/…`. The BH1750 is read in its H-resolution mode 2 at the longest
+measurement time, 0.11 lx per count for dark rooms, and above about 7 klx in H-resolution mode at the shortest.
+The daemon reads it every second and keeps the median of the last five readings in
+`$XDG_RUNTIME_DIR/dasungctl/lux`, where dasungctl picks it up when you change the brightness.
+
+On the tested 25.3" the sensor sees about 1 lx of the front light at 10 %. Since the learned choices include that
+light too, it only shifts the curve in a nearly dark room.
 
 ## Firmware
 

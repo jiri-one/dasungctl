@@ -1,0 +1,4 @@
+# dasungctl auto: the ambient light sensor sits behind a Devantech USB-I2C adapter, which is a stock
+# FT232R, so this covers every FT232R; add ATTRS{serial}=="..." to narrow it to yours.
+# ModemManager must not probe it: its AT commands would reach the I2C bus.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"

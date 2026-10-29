@@ -1,0 +1,10 @@
+[Unit]
+Description=dasungctl: learn the front light from the room light and set it
+
+[Service]
+ExecStart=%h/.local/bin/dasungctl auto daemon
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

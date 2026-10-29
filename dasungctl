@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
+import bisect
 import fcntl
+import json
+import math
 import os
 import select
 import signal
+import statistics
 import subprocess
 import sys
 import termios
 import time
 import tty
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 DESCRIPTION = "Control the front light and display settings of Dasung Paperlike e-ink monitors."
@@ -38,6 +44,41 @@ STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") /
 RUNTIME = Path(os.environ["XDG_RUNTIME_DIR"]) / "dasungctl" if os.environ.get("XDG_RUNTIME_DIR") else None
 
 LABELS = {"253": 'Dasung 25.3"', "13": 'Dasung 13.3"'}
+
+# The light sensor is a BH1750 on a Devantech USB-I2C adapter, which is a stock FT232R.
+FTDI_FT232R = ("0403", "6001")
+I2C_SGL, I2C_MUL, I2C_USB, REVISION = 0x53, 0x54, 0x5A, 0x01
+BH1750_ADDRESSES = (0x23, 0x5C)
+BH1750_ON = 0x01
+# Mode, measurement time register, lux per count and the longest measurement in seconds.
+# H-resolution mode 2 at the longest time resolves 0.11 lx, which a dark room needs, but
+# saturates at 7.4 klx; H-resolution mode at the shortest time reaches 120 klx.
+DIM = (0x11, 254, 69 / 254 / 1.2 / 2, 0.67)
+BRIGHT = (0x10, 31, 69 / 31 / 1.2, 0.09)
+
+AMBIENT = RUNTIME / "lux" if RUNTIME else None
+
+# A year of daily use of the 25.3" never needed more.
+AUTO_MAX = 10
+TICK = 1.0
+# Seconds; a passing shadow must not move the light.
+SMOOTHING = 20.0
+STEP_TICKS = 2
+# Beyond rounding, so that the light does not flicker between two levels.
+HYSTERESIS = 0.25
+# A brightness set by hand stays until the light moves this far on the light scale.
+HOLD = 0.15
+# Seconds; a held key sets many levels but chooses only the last one.
+BURST = 30
+GRID_STEP = 0.05
+GRID = [i * GRID_STEP for i in range(101)]
+BANDWIDTH = 0.15
+KERNEL = [math.exp(-0.5 * (i * GRID_STEP / BANDWIDTH) ** 2) for i in range(21)]
+# A correction must stick at once without wiping out what was learned around it.
+FORGET = 0.9
+LOG_KEEP = [math.log(1 - FORGET * k) for k in KERNEL]
+SUPPORT = 0.3
+ROWS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
 
 
 class Busy(Exception):
@@ -197,6 +238,125 @@ class Monitor:
         return payload[3]
 
 
+class Sensor:
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        try:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Busy from None
+            cc = termios.tcgetattr(self.fd)[6]
+            cc[termios.VMIN] = 0
+            cc[termios.VTIME] = 0
+            cflag = termios.CS8 | termios.CSTOPB | termios.CREAD | termios.CLOCAL
+            termios.tcsetattr(self.fd, termios.TCSANOW,
+                              [0, 0, cflag, 0, termios.B19200, termios.B19200, cc])
+            if self.transfer([I2C_USB, REVISION, 0, 0], 1) is None:
+                raise Error(f"no USB-I2C adapter answers on {path}")
+            self.address = next((a for a in BH1750_ADDRESSES if self.command(BH1750_ON, a)), None)
+            if self.address is None:
+                raise Error(f"no BH1750 light sensor answers on {path}")
+            self.configure(DIM)
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def transfer(self, request, size):
+        # A reply left over from an interrupted request would shift every later reading.
+        try:
+            termios.tcflush(self.fd, termios.TCIFLUSH)
+        except termios.error:
+            raise OSError("the light sensor went away") from None
+        # The adapter ignores a request whose bytes arrive with gaps between them.
+        os.write(self.fd, bytes(request))
+        reply = b""
+        deadline = time.monotonic() + 0.5
+        while len(reply) < size:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+                return None
+            data = os.read(self.fd, size - len(reply))
+            if not data:
+                raise OSError("the light sensor went away")
+            reply += data
+        return reply
+
+    def command(self, value, address=None):
+        address = self.address if address is None else address
+        reply = self.transfer([I2C_SGL, address << 1, value], 1)
+        return bool(reply and reply[0])
+
+    def configure(self, sensitivity):
+        mode, mtreg, self.scale, longest = sensitivity
+        for value in (0x40 | (mtreg >> 5), 0x60 | (mtreg & 0x1F), mode):
+            if not self.command(value):
+                raise Error("the light sensor did not accept its settings")
+        self.sensitivity = sensitivity
+        # Until its first measurement in the new mode ends, the sensor returns the old one.
+        time.sleep(longest)
+
+    def count(self):
+        reply = self.transfer([I2C_MUL, (self.address << 1) | 1, 2], 2)
+        if reply is None:
+            raise Error("the light sensor did not answer")
+        return reply[0] << 8 | reply[1]
+
+    def lux(self):
+        count = self.count()
+        if self.sensitivity is DIM and count > 60000:
+            self.configure(BRIGHT)
+            count = self.count()
+        elif self.sensitivity is BRIGHT and count * self.scale < 5000:
+            self.configure(DIM)
+            count = self.count()
+        return count * self.scale
+
+
+def find_sensors():
+    found = []
+    for tty_dir in sorted(Path("/sys/class/tty").glob("ttyUSB*")):
+        try:
+            dev = (tty_dir / "device").resolve().parents[1]
+        except (OSError, IndexError):
+            continue
+        if usb_id(dev) == FTDI_FT232R:
+            found.append(f"/dev/{tty_dir.name}")
+    return found
+
+
+def open_sensor(path=None):
+    if path is None:
+        found = find_sensors()
+        if not found:
+            raise Error("no light sensor found on USB (a Devantech USB-I2C adapter, see README)")
+        if len(found) > 1:
+            raise Error(f"several FT232R adapters ({', '.join(found)}), pick one with --sensor")
+        path = found[0]
+    try:
+        return Sensor(path)
+    except PermissionError:
+        raise Error(f"no access to {path}, install 71-usb-i2c.rules (see README)") from None
+    except OSError as e:
+        raise Error(f"cannot use {path}: {e.strerror or e}") from None
+    except termios.error:
+        raise Error(f"{path} is not a serial port") from None
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def remember_mode(name, mode):
     try:
         STATE.mkdir(parents=True, exist_ok=True)
@@ -223,6 +383,16 @@ def level_arg(text):
     return text
 
 
+def percent_arg(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("use 0-100")
+    return value
+
+
 def byte_arg(text):
     try:
         value = int(text, 16)
@@ -233,24 +403,32 @@ def byte_arg(text):
     return value
 
 
-def brightness(mon, name, text):
+def read_level(mon):
     mode = mon.get(LIGHT)
-    current = mon.get(BRIGHTNESS) if mode else 0
+    return mode, mon.get(BRIGHTNESS) if mode else 0
+
+
+def set_level(mon, name, mode, current, target):
+    if target == current:
+        return
+    # Brightness 0 doubles as "off" so that one pair of keys covers the whole range.
+    if target == 0:
+        remember_mode(name, mode)
+        mon.set(LIGHT, 0)
+        return
+    mon.set(BRIGHTNESS, target)
+    if not mode:
+        mon.set(LIGHT, remembered_mode(name))
+
+
+def brightness(mon, name, text):
+    mode, current = read_level(mon)
     if text is None:
         print(current)
         return current
     value = int(text)
     target = max(0, min(100, current + value if text[0] in "+-" else value))
-    if target == current:
-        return current
-    # Brightness 0 doubles as "off" so that one pair of keys covers the whole range.
-    if target == 0:
-        remember_mode(name, mode)
-        mon.set(LIGHT, 0)
-        return 0
-    mon.set(BRIGHTNESS, target)
-    if not mode:
-        mon.set(LIGHT, remembered_mode(name))
+    set_level(mon, name, mode, current, target)
     return target
 
 
@@ -276,10 +454,7 @@ def notify(title, body, slot, *, error=False):
     # The daemon hands out a new id once the old notification has expired.
     if id_file and new.isdigit() and int(new) != previous:
         try:
-            id_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = id_file.with_name(f"{id_file.name}.{os.getpid()}")
-            tmp.write_text(new)
-            os.replace(tmp, id_file)
+            write_atomic(id_file, new)
         except OSError:
             pass
 
@@ -288,6 +463,7 @@ def tune(mon, name):
     if not sys.stdin.isatty():
         raise Error("tune needs a terminal")
     state = {p: mon.get(p) for p in (LIGHT, TEMPERATURE, BRIGHTNESS)}
+    start = state[BRIGHTNESS] if state[LIGHT] else 0
     print(f'Dasung {name}": ←/→ brightness ±1   ↓/↑ temperature ±5   m light   q quit')
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
@@ -360,6 +536,369 @@ def tune(mon, name):
         print()
         if state[LIGHT]:
             remember_mode(name, state[LIGHT])
+        chosen = state[BRIGHTNESS] if state[LIGHT] else 0
+        if chosen != start:
+            remember_choice(name, chosen)
+
+
+def log(message):
+    print(f"dasungctl: {message}", file=sys.stderr, flush=True)
+
+
+def position(lux):
+    # On a log scale equal steps look about equally big; the +1 keeps darkness at 0.
+    return min(math.log10(max(lux, 0.0) + 1), GRID[-1])
+
+
+def ambient():
+    # Only the daemon writes it, so an old value means that it has stopped.
+    if AMBIENT is None:
+        return None
+    try:
+        if time.time() - AMBIENT.stat().st_mtime < 5:
+            return float(AMBIENT.read_text())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def file_stamp(path):
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def settings_file(name):
+    return STATE / f"auto-{name}.json"
+
+
+def read_settings(name):
+    try:
+        settings = json.loads(settings_file(name).read_text())
+        return bool(settings["on"]), int(settings["max"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False, AUTO_MAX
+
+
+def choices_file(name):
+    return STATE / f"choices-{name}.tsv"
+
+
+def remember_choice(name, level, lux=None):
+    lux = ambient() if lux is None else lux
+    if lux is None:
+        return
+    stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(choices_file(name), "a") as f:
+            f.write(f"{stamp}\t{lux:.1f}\t{level}\n")
+    except OSError as e:
+        print(f"dasungctl: cannot remember the brightness: {e.strerror}", file=sys.stderr)
+
+
+def load_choices(name):
+    choices = []
+    try:
+        lines = choices_file(name).read_text().splitlines()
+    except OSError:
+        return choices
+    for line in lines:
+        try:
+            stamp, lux, level = line.split("\t")
+            choices.append((datetime.fromisoformat(stamp).timestamp(), float(lux), int(level)))
+        except ValueError:
+            continue  # cut short by a crash or a full disk
+    # Not sorted: every writer appends while it holds the monitor's port, so the file is in
+    # order even where stamps tie or the clock was set back.
+    return [c for c, after in zip(choices, choices[1:] + [None])
+            if after is None or after[0] - c[0] > BURST]
+
+
+def learn(choices):
+    if not choices:
+        return None
+    num = [0.0] * len(GRID)
+    den = [0.0] * len(GRID)
+    kept = [0.0] * len(GRID)
+    # Newest first: a choice weighs what the newer choices at its light level left of it.
+    for _, lux, level in reversed(choices):
+        j = round(position(lux) / GRID_STEP)
+        weight = math.exp(kept[j])
+        for i in range(max(0, j - len(KERNEL) + 1), min(len(GRID), j + len(KERNEL))):
+            k = KERNEL[abs(i - j)]
+            num[i] += weight * k * level
+            den[i] += weight * k
+            kept[i] += LOG_KEEP[abs(i - j)]
+    # Far from every choice the average would jump halfway between its neighbours, so the
+    # curve runs straight between the light levels that have choices and flat beyond them.
+    points = [(g, n / d) for g, n, d in zip(GRID, num, den) if d >= SUPPORT]
+    return [g for g, _ in points], [v for _, v in points]
+
+
+def predict(curve, x):
+    xs, ys = curve
+    i = bisect.bisect_right(xs, x)
+    if i == 0:
+        return ys[0]
+    if i == len(xs):
+        return ys[-1]
+    return ys[i - 1] + (ys[i] - ys[i - 1]) * (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+
+
+class Autopilot:
+    def __init__(self, name):
+        self.name = name
+        self.label = LABELS.get(name, name)
+        self.on, self.max = False, AUTO_MAX
+        self.settings_stamp = self.problem = None
+        self.choices_stamp = file_stamp(choices_file(name))
+        choices = load_choices(name)
+        self.curve = learn(choices)
+        self.last = choices[-1] if choices else None
+        self.reset()
+
+    def reset(self):
+        self.ema = self.expected = self.goal = self.hold = None
+        self.cooldown = 0
+
+    def reload(self):
+        stamp = file_stamp(settings_file(self.name))
+        if stamp != self.settings_stamp:
+            self.settings_stamp = stamp
+            on, self.max = read_settings(self.name)
+            if on and not self.on:
+                # Switched on, it follows the light at once, even right after a change by hand.
+                self.expected = self.goal = self.hold = None
+            self.on = on
+        stamp = file_stamp(choices_file(self.name))
+        if stamp == self.choices_stamp:
+            return
+        self.choices_stamp = stamp
+        choices = load_choices(self.name)
+        self.curve = learn(choices)
+        last = choices[-1] if choices else None
+        # Compared whole, because stamps can tie or go backwards.
+        if last is not None and last != self.last:
+            _, lux, level = last
+            # A brightness set by hand stays until the light changes.
+            self.expected = self.goal = level
+            self.ema = self.hold = position(lux)
+        self.last = last
+
+    def tick(self, lux, dt):
+        self.reload()
+        if lux is None:
+            return
+        x = position(lux)
+        if self.ema is None:
+            self.ema = x
+        else:
+            self.ema += (x - self.ema) * (1 - math.exp(-dt / SMOOTHING))
+        if not self.on or self.curve is None:
+            return
+        if self.hold is not None:
+            if abs(self.ema - self.hold) < HOLD:
+                return
+            self.hold = None
+        target = min(predict(self.curve, self.ema), self.max)
+        if self.goal is None or abs(target - self.goal) > 0.5 + HYSTERESIS:
+            goal = max(0, min(self.max, round(target)))
+            if goal != self.goal:
+                log(f"{self.label}: {10 ** self.ema - 1:.0f} lx, learned {target:.1f}")
+            self.goal = goal
+        self.cooldown -= 1
+        if self.goal != self.expected and self.cooldown <= 0:
+            self.cooldown = STEP_TICKS
+            self.step(lux)
+
+    def step(self, lux):
+        ports = [p for n, p in find_ports() if n == self.name]
+        if len(ports) > 1:
+            self.trouble(f"auto cannot tell {len(ports)} monitors of this model apart")
+        if len(ports) != 1:
+            return
+        with open(RUNTIME / f"stepping-{self.name}", "w") as stepping:
+            fcntl.flock(stepping, fcntl.LOCK_EX)
+            try:
+                mon = Monitor(ports[0], wait=0)
+            except Busy:
+                return  # a key binding is using it; the next step tries again
+            except (OSError, termios.error) as e:
+                self.trouble(f"cannot open {ports[0]}: {e}")
+                return
+            try:
+                mode, current = read_level(mon)
+                if self.expected is not None and current != self.expected:
+                    # The monitor's buttons, which only an open port would hear about.
+                    remember_choice(self.name, current, lux)
+                    self.expected = current
+                    return
+                target = current + (1 if self.goal > current else -1 if self.goal < current else 0)
+                # From a level set by hand above the limit, the first step goes straight to it.
+                target = min(target, self.max)
+                set_level(mon, self.name, mode, current, target)
+                self.expected = target
+                self.problem = None
+            except (Error, OSError) as e:
+                self.trouble(str(e))
+                self.expected = None
+            finally:
+                mon.close()
+
+    def trouble(self, message):
+        # A monitor that keeps failing must neither flood the journal nor hog its port.
+        if message != self.problem:
+            log(f"{self.label}: {message}")
+            self.problem = message
+        self.cooldown = 30
+
+
+def daemon(path):
+    if AMBIENT is None:
+        raise Error("XDG_RUNTIME_DIR is not set")
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    instance = os.open(RUNTIME / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        # A second daemon would find the sensor busy and keep deleting the first one's reading.
+        fcntl.flock(instance, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Error("the auto daemon is already running") from None
+    # systemd stops a service with SIGTERM; leaving through finally removes the last reading.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    sensor = problem = None
+    retry = 0.0
+    recent = deque(maxlen=5)
+    pilots = {}
+    last, last_boot = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
+    try:
+        while True:
+            now, boot = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
+            dt = now - last
+            # Only the boot clock runs during suspend; USB is reset then and the light changed.
+            if boot - last_boot - dt > 5:
+                if sensor:
+                    sensor.close()
+                sensor, retry = None, 0.0
+                recent.clear()
+                for pilot in pilots.values():
+                    pilot.reset()
+            last, last_boot = now, boot
+            if sensor is None and now >= retry:
+                try:
+                    sensor = open_sensor(path)
+                    log(f"reading the light sensor on {sensor.path}")
+                    problem = None
+                except (Busy, Error) as e:
+                    message = str(e) or "the light sensor is busy"
+                    if message != problem:
+                        log(message)
+                        problem = message
+                    retry = now + 10
+            lux = None
+            if sensor:
+                try:
+                    lux = sensor.lux()
+                except (Error, OSError) as e:
+                    log(f"lost the light sensor: {e}")
+                    sensor.close()
+                    sensor, retry = None, now + 2
+            if lux is None:
+                recent.clear()
+                AMBIENT.unlink(missing_ok=True)
+            else:
+                recent.append(lux)
+                lux = statistics.median(recent)
+                try:
+                    write_atomic(AMBIENT, f"{lux:.1f}\n")
+                except OSError:
+                    pass  # the next tick tries again
+            for settings in STATE.glob("auto-*.json"):
+                name = settings.stem[len("auto-"):]
+                if name not in pilots:
+                    pilots[name] = Autopilot(name)
+            for pilot in pilots.values():
+                pilot.tick(lux, dt)
+            time.sleep(max(0.0, TICK - (time.monotonic() - now)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if sensor:
+            sensor.close()
+        AMBIENT.unlink(missing_ok=True)
+
+
+def show_lux(path):
+    lux = ambient()
+    if lux is None:
+        try:
+            sensor = open_sensor(path)
+        except Busy:
+            raise Error("the light sensor is busy") from None
+        try:
+            lux = sensor.lux()
+        except OSError as e:
+            raise Error(f"lost the light sensor: {e}") from None
+        finally:
+            sensor.close()
+    print(f"{lux:.1f}")
+
+
+def bar(value):
+    full, eighths = divmod(round(value * 8), 8)
+    return "█" * full + ("▏▎▍▌▋▊▉"[eighths - 1] if eighths else "")
+
+
+def show_auto(name):
+    on, cap = read_settings(name)
+    lux = ambient()
+    choices = load_choices(name)
+    print(f"{LABELS.get(name, name)}: automatic brightness "
+          + (f"on, never above {cap}" if on else "off, only learning"))
+    if lux is None:
+        print("The daemon is not running, so nothing is learned or set (see README).")
+    if not choices:
+        print("No brightness changes recorded yet.")
+        return
+    curve = learn(choices)
+    first, last = (time.strftime("%-d %b %H:%M", time.localtime(c[0]))
+                   for c in (choices[0], choices[-1]))
+    print(f"Learned from {len(choices)} change{'s' if len(choices) > 1 else ''}, "
+          + (first if first == last else f"{first} to {last}") + ".")
+    if lux is not None:
+        print(f"Light now {lux:.0f} lx, learned brightness for it "
+              f"{min(predict(curve, position(lux)), cap):.1f}.")
+    rows = [position(r) for r in ROWS]
+
+    def nearest(x):
+        return min(range(len(rows)), key=lambda i: abs(rows[i] - x))
+
+    counts = [0] * len(rows)
+    for _, at, _ in choices:
+        counts[nearest(position(at))] += 1
+    now = None if lux is None else nearest(position(lux))
+    print("\n    lux  brightness     changes")
+    for i, (row, x) in enumerate(zip(ROWS, rows)):
+        value = min(predict(curve, x), cap)
+        print(f"{row:7}  {value:4.1f}  {bar(value):10}  {counts[i] or '':>4}"
+              + ("  ← now" if i == now else ""))
+
+
+def auto_command(args, name):
+    if args.action is None:
+        show_auto(name)
+        return None
+    try:
+        write_atomic(settings_file(name),
+                     json.dumps({"on": args.action == "on", "max": args.max}) + "\n")
+    except OSError as e:
+        raise Error(f"cannot save the setting: {e.strerror}") from None
+    if ambient() is None:
+        print("dasungctl: the daemon is not running (see README), so nothing changes yet",
+              file=sys.stderr)
+    return f"Automatic brightness {args.action}"
 
 
 def show_info(mon):
@@ -394,6 +933,8 @@ def command(mon, args, name):
         tune(mon, name)
     elif args.cmd == "brightness":
         level = brightness(mon, name, args.value)
+        if args.value is not None:
+            remember_choice(name, level)
         return f"Brightness {level} %" if level else "Front light off"
     elif args.cmd == "light":
         if args.value is None:
@@ -423,8 +964,33 @@ def command(mon, args, name):
     return None
 
 
+def wait_for_daemon_step(name, timeout=1.0):
+    if RUNTIME is None:
+        return
+    try:
+        fd = os.open(RUNTIME / f"stepping-{name}", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
+    finally:
+        os.close(fd)
+
+
 def run(args, name, port):
     relative = args.cmd == "brightness" and args.value is not None and args.value[0] in "+-"
+    if relative:
+        # The daemon's step is over in a moment, so a key press need not be lost to it; the
+        # repeats of a held key that waited too still race for the port, and all but one lose.
+        wait_for_daemon_step(name)
     try:
         mon = Monitor(port, args.debug, wait=0 if relative else 3.0)
     except Busy:
@@ -457,6 +1023,7 @@ def main():
     ap.add_argument("-m", "--monitor", choices=["253", "13"],
                     help='25.3" or 13.3" model (default: the only one connected, else 253)')
     ap.add_argument("--port", help="serial device instead of autodetection")
+    ap.add_argument("--sensor", help="serial device of the light sensor instead of autodetection")
     ap.add_argument("--notify", action="store_true",
                     help="show changes and errors as a desktop notification, e.g. from key bindings")
     ap.add_argument("--debug", action="store_true", help="print raw frames")
@@ -484,16 +1051,39 @@ def main():
     raw.add_argument("value", type=byte_arg, nargs="?", default=0, help="hex, default 00")
     raw.add_argument("--wait", type=float, default=1.0, help="seconds to wait for replies")
     sub.add_parser("watch", help="print the frames the monitor sends")
+    sub.add_parser("lux", help="room light in lux, from the light sensor")
+    auto = sub.add_parser("auto", help="set the brightness from the room light, as learned from "
+                                       "the changes you make yourself; without an action show "
+                                       "what has been learned")
+    auto.add_argument("action", nargs="?", choices=["on", "off", "daemon"],
+                      help="on: follow the room light; off: only learn; daemon: read the sensor, "
+                           "learn and adjust (run it as a user service)")
+    auto.add_argument("--max", type=percent_arg, default=AUTO_MAX,
+                      help=f"highest brightness auto sets (default {AUTO_MAX})")
     args = ap.parse_args()
 
     name = args.monitor or "dasung"
     try:
+        if args.cmd == "lux":
+            show_lux(args.sensor)
+            return
+        if args.cmd == "auto" and args.action == "daemon":
+            daemon(args.sensor)
+            return
         found = find_ports()
         if args.cmd == "list":
             if not found:
                 raise Error("no Dasung monitor found on USB")
             for monitor, port in found:
                 print(f'{monitor}"  {port}')
+            return
+        if args.cmd == "auto":
+            models = {n for n, _ in found}
+            # What was learned stays readable and switchable while the monitor is off.
+            name = args.monitor or (models.pop() if len(models) == 1 else "253")
+            text = auto_command(args, name)
+            if text and args.notify:
+                notify(LABELS.get(name, "Dasung"), text, name)
             return
         if args.port:
             port = args.port
